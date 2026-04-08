@@ -3,6 +3,7 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <TinyGPSPlus.h>
+#include "config.h"
 #include "secrets.h"
 
 // GPS module on UART0 (GP0=TX, GP1=RX)
@@ -17,13 +18,14 @@
 #define WIFI_PASSWORD "your_wifi_password"
 #endif
 
-// Timing intervals (milliseconds)
-#define PUBLISH_INTERVAL        10000   // Publish GPS every 10 seconds
-#define WIFI_CHECK_INTERVAL     5000    // Check WiFi every 5 seconds
-#define MQTT_CHECK_INTERVAL     5000    // Check MQTT every 5 seconds
-#define WIFI_RECONNECT_DELAY    5000    // Wait between WiFi reconnect attempts
-#define MQTT_RECONNECT_DELAY    5000    // Wait between MQTT reconnect attempts
-#define MAX_RECONNECT_DELAY     60000   // Max backoff delay (1 minute)
+// ========== Configurable cycle frequency ==========
+// How often to wake, connect, get a fix, and publish.
+// Examples: 60000UL = 1 min (testing), 3600000UL = 1 hour, 21600000UL = 6 hours
+#define PUBLISH_INTERVAL_MS     300000UL
+
+// Per-cycle timeouts
+#define WIFI_CONNECT_TIMEOUT_MS 20000UL  // Max time to wait for WiFi association
+#define GPS_FIX_WAIT_MS         60000UL  // Max time to wait for a fresh GPS fix
 
 // TinyGPS++ object
 TinyGPSPlus gps;
@@ -32,18 +34,8 @@ TinyGPSPlus gps;
 WiFiClientSecure wifiClient;
 PubSubClient mqttClient(wifiClient);
 
-// Timing state
-uint32_t lastPublish = 0;
-uint32_t lastWiFiCheck = 0;
-uint32_t lastMQTTCheck = 0;
-uint32_t lastWiFiReconnectAttempt = 0;
-uint32_t lastMQTTReconnectAttempt = 0;
-
-// Reconnection backoff state
-uint32_t wifiReconnectDelay = WIFI_RECONNECT_DELAY;
-uint32_t mqttReconnectDelay = MQTT_RECONNECT_DELAY;
-uint32_t wifiReconnectCount = 0;
-uint32_t mqttReconnectCount = 0;
+// Cycle timing
+uint32_t lastCycle = 0;
 
 // Connection state
 bool tlsConfigured = false;
@@ -52,11 +44,12 @@ bool tlsConfigured = false;
 char system_id[9] = "813EA37B";  // 8 hex chars + null terminator
 
 // Function declarations
-void checkWiFiConnection();
-void checkMQTTConnection();
+void runCycle();
+void endCycle(const char* reason);
 bool connectWiFi();
 bool connectMQTT();
 void publishGPSData();
+void publishHeartbeat(const char* status);
 void displayStatus();
 void processGPS();
 
@@ -92,128 +85,106 @@ void setup() {
     // Configure MQTT
     mqttClient.setServer(AWS_IOT_ENDPOINT, 8883);
     mqttClient.setBufferSize(512);
-    mqttClient.setKeepAlive(60);  // 60 second keepalive
-
-    // Initial connection attempts
-    connectWiFi();
-    if (WiFi.status() == WL_CONNECTED) {
-        connectMQTT();
-    }
+    mqttClient.setKeepAlive(60);     // 60 second keepalive
+    mqttClient.setSocketTimeout(30); // 30 s — covers cold TLS handshake on Pico W
 
     Serial.println();
     Serial.println("=== Setup Complete ===");
-    Serial.println("GPS tracking active. Connections will auto-recover.");
+    Serial.print("GPS tracker active. Cycle interval: ");
+    Serial.print(PUBLISH_INTERVAL_MS / 1000);
+    Serial.println(" seconds.");
+    Serial.println("First cycle will run immediately.");
     Serial.println();
+
+    // Force first cycle to run immediately on entering loop()
+    lastCycle = millis() - PUBLISH_INTERVAL_MS;
 }
 
 void loop() {
-    uint32_t now = millis();
-
-    // Always process GPS data (non-blocking)
+    // Always drain GPS serial so the parser stays current and the UART
+    // buffer never overflows between cycles.
     processGPS();
 
-    // Periodically check WiFi connection
-    if (now - lastWiFiCheck >= WIFI_CHECK_INTERVAL) {
-        lastWiFiCheck = now;
-        checkWiFiConnection();
-    }
-
-    // Periodically check MQTT connection (only if WiFi is up)
-    if (WiFi.status() == WL_CONNECTED && (now - lastMQTTCheck >= MQTT_CHECK_INTERVAL)) {
-        lastMQTTCheck = now;
-        checkMQTTConnection();
-    }
-
-    // Process MQTT messages (non-blocking)
+    // Keep MQTT keepalive happy if we happen to still be connected.
     if (mqttClient.connected()) {
         mqttClient.loop();
     }
 
-    // Publish GPS data at interval
-    if (now - lastPublish >= PUBLISH_INTERVAL) {
-        lastPublish = now;
-        displayStatus();
+    // Run a full publish cycle once per interval.
+    uint32_t now = millis();
+    if (now - lastCycle >= PUBLISH_INTERVAL_MS) {
+        lastCycle = now;
+        runCycle();
+    }
+}
 
-        if (gps.location.isValid() && mqttClient.connected()) {
-            publishGPSData();
-        } else if (!gps.location.isValid()) {
-            Serial.println("[GPS] No fix yet - not publishing");
-        } else if (!mqttClient.connected()) {
-            Serial.println("[MQTT] Not connected - data queued in GPS buffer");
+void runCycle() {
+    Serial.println();
+    Serial.println("========== Cycle start ==========");
+    displayStatus();
+
+    // 1. Ensure WiFi (kept associated between cycles, just re-checked here)
+    if (WiFi.status() != WL_CONNECTED) {
+        if (!connectWiFi()) {
+            endCycle("WiFi unavailable - aborting cycle");
+            return;
         }
     }
+
+    // 2. Fresh MQTT connection every cycle (wake-publish-sleep pattern)
+    if (!connectMQTT()) {
+        endCycle("MQTT unavailable - aborting cycle");
+        return;
+    }
+
+    // 3. Publish heartbeat immediately on the fresh connection. This proves
+    //    we can publish to MQTT_STATUS_TOPIC and gives an early liveness signal
+    //    independent of whether we eventually get a GPS fix.
+    publishHeartbeat("online");
+
+    // 4. Wait for a GPS fix (drain serial + service MQTT during the wait).
+    Serial.println("[CYCLE] Waiting for GPS fix...");
+    uint32_t waitStart = millis();
+    while (!gps.location.isValid() && (millis() - waitStart) < GPS_FIX_WAIT_MS) {
+        processGPS();
+        if (mqttClient.connected()) {
+            mqttClient.loop();
+        } else {
+            Serial.println("[MQTT] Connection lost during GPS wait");
+            break;
+        }
+        delay(10);
+    }
+
+    // 5. Publish GPS telemetry only if we have a valid fix
+    if (gps.location.isValid()) {
+        publishGPSData();
+    } else {
+        Serial.println("[CYCLE] No GPS fix - telemetry skipped");
+    }
+
+    endCycle(NULL);
+}
+
+void endCycle(const char* reason) {
+    if (reason) {
+        Serial.print("[CYCLE] ");
+        Serial.println(reason);
+    }
+    // Tear down MQTT cleanly (suppresses LWT) and close the TLS socket so the
+    // next cycle starts with a fresh handshake. WiFi stays associated.
+    if (mqttClient.connected()) {
+        mqttClient.disconnect();
+    }
+    wifiClient.stop();
+    Serial.println("[CYCLE] Sleeping until next cycle");
+    Serial.println("========== Cycle end ==========");
 }
 
 void processGPS() {
     // Read all available GPS data (non-blocking)
     while (GPS_SERIAL.available() > 0) {
         gps.encode(GPS_SERIAL.read());
-    }
-}
-
-void checkWiFiConnection() {
-    if (WiFi.status() == WL_CONNECTED) {
-        // Connected - reset backoff
-        if (wifiReconnectCount > 0) {
-            Serial.println("[WiFi] Connection restored!");
-            wifiReconnectCount = 0;
-            wifiReconnectDelay = WIFI_RECONNECT_DELAY;
-        }
-        return;
-    }
-
-    // Not connected - attempt reconnect with backoff
-    uint32_t now = millis();
-    if (now - lastWiFiReconnectAttempt >= wifiReconnectDelay) {
-        lastWiFiReconnectAttempt = now;
-
-        wifiReconnectCount++;
-        Serial.print("[WiFi] Connection lost. Reconnect attempt #");
-        Serial.println(wifiReconnectCount);
-
-        if (connectWiFi()) {
-            // Success - reset backoff
-            wifiReconnectDelay = WIFI_RECONNECT_DELAY;
-        } else {
-            // Failed - increase backoff (exponential with cap)
-            wifiReconnectDelay = min(wifiReconnectDelay * 2, MAX_RECONNECT_DELAY);
-            Serial.print("[WiFi] Next retry in ");
-            Serial.print(wifiReconnectDelay / 1000);
-            Serial.println(" seconds");
-        }
-    }
-}
-
-void checkMQTTConnection() {
-    if (mqttClient.connected()) {
-        // Connected - reset backoff
-        if (mqttReconnectCount > 0) {
-            Serial.println("[MQTT] Connection restored!");
-            mqttReconnectCount = 0;
-            mqttReconnectDelay = MQTT_RECONNECT_DELAY;
-        }
-        return;
-    }
-
-    // Not connected - attempt reconnect with backoff
-    uint32_t now = millis();
-    if (now - lastMQTTReconnectAttempt >= mqttReconnectDelay) {
-        lastMQTTReconnectAttempt = now;
-
-        mqttReconnectCount++;
-        Serial.print("[MQTT] Connection lost. Reconnect attempt #");
-        Serial.println(mqttReconnectCount);
-
-        if (connectMQTT()) {
-            // Success - reset backoff
-            mqttReconnectDelay = MQTT_RECONNECT_DELAY;
-        } else {
-            // Failed - increase backoff (exponential with cap)
-            mqttReconnectDelay = min(mqttReconnectDelay * 2, MAX_RECONNECT_DELAY);
-            Serial.print("[MQTT] Next retry in ");
-            Serial.print(mqttReconnectDelay / 1000);
-            Serial.println(" seconds");
-        }
     }
 }
 
@@ -228,14 +199,12 @@ bool connectWiFi() {
 
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-    // Wait for connection with timeout (non-blocking friendly)
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    // Wait for association up to WIFI_CONNECT_TIMEOUT_MS
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < WIFI_CONNECT_TIMEOUT_MS) {
         delay(500);
         Serial.print(".");
-        attempts++;
-
-        // Keep GPS running during WiFi connect
+        // Keep GPS parser fed during WiFi connect
         processGPS();
     }
 
@@ -269,13 +238,32 @@ bool connectMQTT() {
     String clientId = "GPS_Tracker_";
     clientId += String(rp2040.getChipID(), HEX);
 
-    // Single connection attempt (backoff handled by caller)
-    if (mqttClient.connect(clientId.c_str())) {
+    // Register Last Will & Testament: broker auto-publishes "offline" if we
+    // disconnect without sending a clean DISCONNECT (power loss, crash, etc.).
+    // Note: willRetain=false because retained publishes are denied by this
+    // account's IoT auth layer despite the policy granting iot:PublishRetain.
+    char willPayload[96];
+    snprintf(willPayload, sizeof(willPayload),
+        "{\"system_id\":\"%s\",\"status\":\"offline\"}", system_id);
+
+    // connect(clientID, user, pass, willTopic, willQos, willRetain, willMessage)
+    if (mqttClient.connect(clientId.c_str(),
+                           NULL, NULL,
+                           MQTT_STATUS_TOPIC, 1, false, willPayload)) {
         Serial.println(" Connected!");
         Serial.print("[MQTT] Client ID: ");
         Serial.println(clientId);
-        Serial.print("[MQTT] Topic: ");
+        Serial.print("[MQTT] Telemetry topic: ");
         Serial.println(MQTT_TOPIC);
+        Serial.print("[MQTT] Status topic:    ");
+        Serial.println(MQTT_STATUS_TOPIC);
+
+        // Publish an "online" marker on every fresh connect (non-retained).
+        char onlinePayload[96];
+        snprintf(onlinePayload, sizeof(onlinePayload),
+            "{\"system_id\":\"%s\",\"status\":\"online\"}", system_id);
+        mqttClient.publish(MQTT_STATUS_TOPIC, onlinePayload, false);
+
         return true;
     } else {
         Serial.print(" Failed! RC=");
@@ -294,6 +282,48 @@ bool connectMQTT() {
             case 5:  Serial.println("       (Unauthorized)"); break;
         }
         return false;
+    }
+}
+
+void publishHeartbeat(const char* status) {
+    if (!mqttClient.connected()) {
+        Serial.println("[MQTT] Not connected, cannot publish heartbeat");
+        return;
+    }
+
+    // Liveness payload — independent of GPS fix. Includes diagnostics that
+    // help distinguish "alive but no fix" from "alive but GPS broken".
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+        "{"
+        "\"system_id\":\"%s\","
+        "\"status\":\"%s\","
+        "\"uptime_s\":%lu,"
+        "\"wifi_rssi\":%d,"
+        "\"fix_valid\":%s,"
+        "\"satellites\":%d,"
+        "\"hdop\":%.2f,"
+        "\"chars_processed\":%lu"
+        "}",
+        system_id,
+        status,
+        (unsigned long)(millis() / 1000),
+        WiFi.RSSI(),
+        gps.location.isValid() ? "true" : "false",
+        gps.satellites.isValid() ? gps.satellites.value() : 0,
+        gps.hdop.isValid() ? gps.hdop.hdop() : 99.99,
+        (unsigned long)gps.charsProcessed()
+    );
+
+    // Non-retained: this account's IoT auth layer denies retained publishes
+    // even though the policy grants iot:PublishRetain. Subscribers should
+    // judge liveness by heartbeat freshness rather than the retained value.
+    if (mqttClient.publish(MQTT_STATUS_TOPIC, payload, false)) {
+        Serial.println("[MQTT] Heartbeat published:");
+        Serial.print("  ");
+        Serial.println(payload);
+    } else {
+        Serial.println("[MQTT] Heartbeat publish failed!");
     }
 }
 
@@ -353,34 +383,14 @@ void displayStatus() {
     if (WiFi.status() == WL_CONNECTED) {
         Serial.print("Connected (");
         Serial.print(WiFi.RSSI());
-        Serial.print(" dBm)");
-        if (wifiReconnectCount > 0) {
-            Serial.print(" [recovered after ");
-            Serial.print(wifiReconnectCount);
-            Serial.print(" attempts]");
-        }
-        Serial.println();
+        Serial.println(" dBm)");
     } else {
-        Serial.print("Disconnected (retry #");
-        Serial.print(wifiReconnectCount);
-        Serial.println(")");
+        Serial.println("Disconnected");
     }
 
     // MQTT status
     Serial.print("[MQTT] ");
-    if (mqttClient.connected()) {
-        Serial.print("Connected");
-        if (mqttReconnectCount > 0) {
-            Serial.print(" [recovered after ");
-            Serial.print(mqttReconnectCount);
-            Serial.print(" attempts]");
-        }
-        Serial.println();
-    } else {
-        Serial.print("Disconnected (retry #");
-        Serial.print(mqttReconnectCount);
-        Serial.println(")");
-    }
+    Serial.println(mqttClient.connected() ? "Connected" : "Disconnected");
 
     // GPS status
     Serial.print("[GPS] Location: ");
