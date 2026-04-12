@@ -17,8 +17,9 @@
 // Note: this account silently denies publishes to topics ending in "/status"
 // and silently denies retained publishes regardless of policy. Hence
 // "/heartbeat" and the non-retained publishes everywhere. See git history.
-#define MQTT_TOPIC        "dev/device/tracker/telemetry"
-#define MQTT_STATUS_TOPIC "dev/device/tracker/heartbeat"
+#define MQTT_TOPIC          "dev/device/+/geolocation"
+#define MQTT_STATUS_TOPIC   "dev/device/+/geolocation/heartbeat"
+#define MQTT_DOWNLINK_TOPIC "dev/device/+/geolocation/downlink"
 
 // Amazon Root CA 1 — public, identical for every AWS account.
 static const char AWS_ROOT_CA[] PROGMEM = R"EOF(
